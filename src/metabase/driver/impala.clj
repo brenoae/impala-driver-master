@@ -1,33 +1,31 @@
 (ns metabase.driver.impala
-  (:require [clojure
-             [set :as set]
-             [string :as str]]
-            [clojure.java.jdbc :as jdbc]
-            [clojure.tools.logging :as log]
-            [honeysql.core :as hsql]
-            [java-time :as t]
-            [metabase
-             [driver :as driver]
-             [util :as u]]
-            [metabase.db.spec :as dbspec]
-            [metabase.driver.common :as driver.common]
-            [metabase.driver.sql-jdbc
-             [common :as sql-jdbc.common]
-             [connection :as sql-jdbc.conn]
-             [execute :as sql-jdbc.execute]
-             [sync :as sql-jdbc.sync]]
-            [metabase.driver.sql.query-processor :as sql.qp]
-            [metabase.driver.sql.util.unprepare :as unprepare]
-            [metabase.models.table :refer [Table]]
-            [metabase.query-processor.timezone :as qp.timezone]
-            [metabase.util
-             [date-2 :as u.date]
-             [honeysql-extensions :as hx]
-             [i18n :refer [trs]]
-             [ssh :as ssh]]
-            [toucan.db :as db])
-  (:import [java.sql DatabaseMetaData ResultSet ResultSetMetaData Types]
-           [java.time LocalDate LocalDateTime OffsetDateTime OffsetTime ZonedDateTime]))
+    (:require
+              [clojure.set :as set]
+              [clojure.string :as str]
+              [clojure.java.jdbc :as jdbc]
+              [clojure.tools.logging :as log]
+              [honey.sql :as hsql]
+              [java-time :as t]
+              [metabase
+               [driver :as driver]
+               [util :as u]]
+              [metabase.db.spec :as dbspec]
+              [metabase.driver.common :as driver.common]
+              [metabase.driver.sql-jdbc
+               [common :as sql-jdbc.common]
+               [connection :as sql-jdbc.conn]
+               [execute :as sql-jdbc.execute]
+               [sync :as sql-jdbc.sync]]
+              [metabase.driver.sql.query-processor :as sql.qp]
+              [metabase.driver.sql.util.unprepare :as unprepare]
+              [metabase.models.table :refer [Table]]
+              [metabase.query-processor.timezone :as qp.timezone]
+              [metabase.util.honey-sql-2 :as h2x]
+              [metabase.util.date-2 :as u.date]
+              [toucan2.core :as t2]
+              )
+    (:import [java.sql DatabaseMetaData ResultSet ResultSetMetaData Types]
+             [java.time LocalDate LocalDateTime OffsetDateTime OffsetTime ZonedDateTime]))
 
 ;;; # IMPLEMENTATION
 ;; See http://www.cloudera.com/documentation/other/connectors/impala-jdbc/latest/Cloudera-JDBC-Driver-for-Impala-Install-Guide.pdf
@@ -68,7 +66,7 @@
   [_ {:keys [host port db make-pool? authMech useNative user password connProperties]
       :or {host "localhost", port 21050, db "default", make-pool? true, authMech "0", useNative "1" connProperties ""}
       :as   details}]
-  (-> {:classname "com.cloudera.impala.jdbc41.Driver" ; must be in plugins directory
+  (-> {:classname "com.cloudera.impala.jdbc.Driver" ; must be in plugins directory
           :subprotocol "impala"
           :subname (str "//" host ":" port "/" db ";AuthMech=" authMech ";UID=" user ";PWD=" password ";UseNativeQuery=" useNative ";" connProperties)  ;;Use UseNativeQuery=1 to prevent SQL rewriting by the JDBC driver
           :make-pool? make-pool?}
@@ -84,23 +82,27 @@
 
 (defn- trunc [format-template expr]
   (hsql/call :trunc
-    (hx/->timestamp expr)
-        (hx/literal format-template)))
+             (h2x/->timestamp expr)
+             (h2x/literal format-template)))
 
 (defmethod driver/humanize-connection-error-message :impala
   [_ message]
   (condp re-matches message
     #"^Communications link failure\s+The last packet sent successfully to the server was 0 milliseconds ago. The driver has not received any packets from the server.$"
-    (driver.common/connection-error-messages :cannot-connect-check-host-and-port)
-
+;;  (driver.common.util/connection-error-messages :cannot-connect-check-host-and-port)
+    :cannot-connect-check-host-and-port
+;;
     #"^Unknown database .*$"
-    (driver.common/connection-error-messages :database-name-incorrect)
-
+;;  (driver.common.util/connection-error-messages :database-name-incorrect)
+    :database-name-incorrect
+;;
     #"Access denied for user.*$"
-    (driver.common/connection-error-messages :username-or-password-incorrect)
-
+;;  (driver.common.util/connection-error-messages :username-or-password-incorrect)
+    :username-or-password-incorrect
+;;
     #"Must specify port after ':' in connection string"
-    (driver.common/connection-error-messages :invalid-hostname)
+;;  (driver.common.util/connection-error-messages :invalid-hostname)
+    :invalid-hostname
 
     #".*"                               ; default
     message))
@@ -112,39 +114,39 @@
 
 (defmethod sql.qp/unix-timestamp->honeysql [:impala :seconds]
   [_ _ expr]
-  (hx/->timestamp (hsql/call :from_unixtime expr)))
+  (h2x/->timestamp (hsql/call :from_unixtime expr)))
 
 (defn- date-format [format-str expr]
-  (hsql/call :date_format expr (hx/literal format-str)))
+  (hsql/call :date_format expr (h2x/literal format-str)))
 
 (defn- str-to-date [format-str expr]
-  (hx/->timestamp
+  (h2x/->timestamp
    (hsql/call :from_unixtime
               (hsql/call :unix_timestamp
-                         expr (hx/literal format-str)))))
+                         expr (h2x/literal format-str)))))
 
 (defn- trunc-with-format [format-str expr]
   (str-to-date format-str (date-format format-str expr)))
 
-(defmethod sql.qp/date [:impala :default]         [_ _ expr] (hx/->timestamp expr))
+(defmethod sql.qp/date [:impala :default]         [_ _ expr] (h2x/->timestamp expr))
 (defmethod sql.qp/date [:impala :minute]          [_ _ expr] (trunc :MI expr))
-(defmethod sql.qp/date [:impala :minute-of-hour]  [_ _ expr] (hsql/call :minute (hx/->timestamp expr)))
-(defmethod sql.qp/date [:impala :hour]            [_ _ expr] (trunc :HH expr)) 
-(defmethod sql.qp/date [:impala :hour-of-day]     [_ _ expr] (hsql/call :hour (hx/->timestamp expr)))
-(defmethod sql.qp/date [:impala :day]             [_ _ expr] (trunc :dd expr)) 
-(defmethod sql.qp/date [:impala :day-of-month]    [_ _ expr] (hsql/call :dayofmonth (hx/->timestamp expr)))
-(defmethod sql.qp/date [:impala :day-of-year]     [_ _ expr] (hsql/call :dayofyear expr)) 
-(defmethod sql.qp/date [:impala :week-of-year]    [_ _ expr] (hsql/call :weekofyear (hx/->timestamp expr)))
-(defmethod sql.qp/date [:impala :month]           [_ _ expr] (trunc :month expr)) 
-(defmethod sql.qp/date [:impala :month-of-year]   [_ _ expr] (hsql/call :month (hx/->timestamp expr)))
-(defmethod sql.qp/date [:impala :quarter]         [_ _ expr] (trunc :Q expr)) 
-(defmethod sql.qp/date [:impala :year]            [_ _ expr] (hsql/call :trunc (hx/->timestamp expr) (hx/literal :year)))
+(defmethod sql.qp/date [:impala :minute-of-hour]  [_ _ expr] (hsql/call :minute (h2x/->timestamp expr)))
+(defmethod sql.qp/date [:impala :hour]            [_ _ expr] (trunc :HH expr))
+(defmethod sql.qp/date [:impala :hour-of-day]     [_ _ expr] (hsql/call :hour (h2x/->timestamp expr)))
+(defmethod sql.qp/date [:impala :day]             [_ _ expr] (trunc :dd expr))
+(defmethod sql.qp/date [:impala :day-of-month]    [_ _ expr] (hsql/call :dayofmonth (h2x/->timestamp expr)))
+(defmethod sql.qp/date [:impala :day-of-year]     [_ _ expr] (hsql/call :dayofyear expr))
+(defmethod sql.qp/date [:impala :week-of-year]    [_ _ expr] (hsql/call :weekofyear (h2x/->timestamp expr)))
+(defmethod sql.qp/date [:impala :month]           [_ _ expr] (trunc :month expr))
+(defmethod sql.qp/date [:impala :month-of-year]   [_ _ expr] (hsql/call :month (h2x/->timestamp expr)))
+(defmethod sql.qp/date [:impala :quarter]         [_ _ expr] (trunc :Q expr))
+(defmethod sql.qp/date [:impala :year]            [_ _ expr] (hsql/call :trunc (h2x/->timestamp expr) (h2x/literal :year)))
 (defmethod sql.qp/date [:impala :day-of-week]     [_ _ expr] (hsql/call :dayofweek expr))
-(defmethod sql.qp/date [:impala :week]            [_ _ expr] (trunc :day expr)) 
+(defmethod sql.qp/date [:impala :week]            [_ _ expr] (trunc :day expr))
 
 (defmethod sql.qp/date [:impala :quarter-of-year] 
   [_ _ expr]
-  (hx// (hx/+ (hsql/call :extract :month expr)
+  (h2x// (h2x/+ (hsql/call :extract :month expr)
                                    2)
                              3))
 
@@ -166,17 +168,17 @@
 
 (defmethod sql.qp/add-interval-honeysql-form :impala
   [_ hsql-form amount unit]
-  (hx/+ (hx/->timestamp hsql-form) (hsql/raw (format "INTERVAL %d %s" (int amount) (name unit)))))
+  (h2x/+ (h2x/->timestamp hsql-form) [:raw (format "INTERVAL %d %s" (int amount) (name unit))]))
 
 ;; ignore the schema when producing the identifier
 (defn qualified-name-components
   "Return the pieces that represent a path to `field`, of the form `[table-name parent-fields-name* field-name]`."
   [{field-name :name, table-id :table_id}]
-  [(db/select-one-field :name Table, :id table-id) field-name])
+  [(t2/select-one :name Table, :id table-id) field-name])
 
-(defmethod sql.qp/field->identifier :impala
+(defmethod sql.qp/->honeysql :impala
   [_ field]
-  (apply hsql/qualify (qualified-name-components field)))
+  (apply hsql/call (qualified-name-components field)))
 
 (defmethod unprepare/unprepare-value [:impala String]
   [_ value]
@@ -186,6 +188,10 @@
 (defmethod unprepare/unprepare-value [:impala LocalDate]
   [driver t]
   (unprepare/unprepare-value driver (t/local-date-time t (t/local-time 0))))
+
+(defmethod unprepare/unprepare-value [:impala LocalDateTime]
+  [driver t]
+  (format "to_utc_timestamp('%s', '%s')" (u.date/format-sql (t/local-date-time t)) (t/zone-id "UTC")))
 
 (defmethod unprepare/unprepare-value [:impala OffsetDateTime]
   [_ t]
